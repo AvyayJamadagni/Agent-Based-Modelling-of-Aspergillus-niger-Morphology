@@ -1,5 +1,6 @@
 import os
 import csv
+import time
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -14,22 +15,22 @@ OUTPUT_DIR = "sim_outputs"
 
 # ---- Grid / domain (µm) ----
 EXTENT_UM = 100.0
-CONIDIA_SPAWN_BOX_EXTENT_UM = 80.0
+CONIDIA_SPAWN_BOX_EXTENT_UM = 60.0
 N_GRID = 90
-RNG_SEED = 4
+RNG_SEED = 8
 
 # Grid visualization (drawing every grid line at N=70 is too heavy)
 GRID_PLOT_STRIDE = 5
 
 # ---- Simulation ----
-N_STEPS = 12
+N_STEPS = 7
 TIME_STEP_HR = 1.0   # x-axis on time-series plots
 
 # ---- Nutrients (mM) ----
 NUTRIENT_SPECS = {
-    "Nitrogen":   {"mean": 70.0,  "pm": 3.5},   
-    "Phosphorus": {"mean": 0.011,   "pm": 0.0005},    
-    "Glucose":    {"mean": 55.5,  "pm": 2.775},     
+    "Nitrogen":   {"mean": 37.8,  "pm": 1.89},   
+    "Phosphorus": {"mean": 1.10,   "pm": 0.055},    
+    "Glucose":    {"mean": 777.10,  "pm": 38.855},     
     "Oxygen":     {"mean": 0.2109,  "pm": 0.010545},  
 }
 
@@ -42,9 +43,9 @@ SIGMA_SCALE = {
 CLAMP_TO_PM_RANGE = True
 
 # ---- Conidia (spores) ----
-N_CONIDIA = 11
+N_CONIDIA = 3
 CONIDIUM_DIAMETER_UM = 6.2
-MIN_CONIDIA_SEPARATION_UM = 15.0
+MIN_CONIDIA_SEPARATION_UM = 35.2
 MAX_PLACEMENT_TRIES = 5000
 
 MISS_HYPHA_BASE_PROB = 0.01
@@ -53,23 +54,23 @@ MISS_HYPHA_MAX_PROB = 0.10
 INITIAL_DIR_CONE_DEG = 90.0   # initial growth direction must lie within this cone of the inward (toward-origin) direction
 
 # ---- Hypha growth ----
-MU_MAX = 2.48            # maximum tip growth rate (µm/hr)
+MU_MAX = 19.51            # maximum tip growth rate (µm/hr)
 DEPLETION_RADIUS = 5.0  # radius (µm) around a tip used for sensing & depletion
-HYPHA_RADIUS_UM = 1.8   # physical radius of the hypha cylinder (µm)
+HYPHA_RADIUS_UM = 1.3   # physical radius of the hypha cylinder (µm)
 
 # ---- Apical branching ----
 PSI_BRANCH = 0.8             # branch when  ψ · μ_{t-1} ≥ μ_t  (drop-in-rate threshold)
 MIN_BRANCH_ANGLE_DEG = 50.0   # minimum angle (deg) between the two daughter directions
-APICAL_BRANCH_MIN_STEP = 10    # apical branching disabled while step_idx < this
+APICAL_BRANCH_MIN_STEP = 6    # apical branching disabled while step_idx < this
 
 # ---- Lateral branching ----
 LATERAL_DISTANCE_FROM_TIP = 12.7   # min distance (µm) from any tip for a lateral branching site
-PHI_N = 0.36                      # local N ≥ PHI_N · [N]_init required for a lateral branch
-PHI_P = 0.36                      # local P ≥ PHI_P · [P]_init required for a lateral branch
-LATERAL_BRANCH_MIN_STEP = 10       # lateral branching disabled while step_idx < this
+PHI_N = 0.99                      # local N ≥ PHI_N · [N]_init required for a lateral branch
+PHI_P = 0.99                      # local P ≥ PHI_P · [P]_init required for a lateral branch
+LATERAL_BRANCH_MIN_STEP = 6       # lateral branching disabled while step_idx < this
 
 # ---- Trajectory bias ----
-MAX_DEVIATION_DEG = 75.0     # new growth direction can deviate ≤ this from the tip's current direction
+MAX_DEVIATION_DEG = 70.0     # new growth direction can deviate ≤ this from the tip's current direction
 
 # ---- Nutrient averaging (replaces PDE diffusion) ----
 # No diffusion coefficients, no PDE, no sub-steps. Each step we redistribute
@@ -124,6 +125,75 @@ def write_csv(path, fieldnames, rows):
         for r in rows:
             w.writerow(r)
     print(f"[CSV] wrote: {full}")
+
+
+# =============================================================================
+# EXCEL (incremental, crash-safe) TIME-SERIES WRITER
+# =============================================================================
+# The time-series workbook is created BEFORE the main loop, and one row is
+# appended and flushed to disk after every completed timestep. If the run is
+# interrupted partway through (e.g. Ctrl+C), every completed step is already
+# saved in the workbook on disk.
+
+def time_series_fieldnames():
+    """Column order for the time-series outputs (same columns as the CSV export)."""
+    names = [
+        "step", "time_hr",
+        "total_length_um", "total_volume_um3",
+        "avg_length_um", "avg_volume_um3", "avg_tips_per_hypha",
+        "n_hyphae", "total_branch_nodes", "total_tips",
+        "citric_total_mmol", "citric_mM", "liquid_volume_L",
+        "apical_branch_events", "lateral_branch_events",
+    ]
+    names += [f"mean_{nutr}_mM" for nutr in NUTRIENT_SPECS.keys()]
+    return names
+
+
+def _save_workbook_atomic(wb, full):
+    """Save `wb` to `full` via a temp file + atomic replace, so an interrupt
+    mid-save can never leave a half-written (corrupt) workbook at `full`."""
+    tmp = full + ".tmp"
+    wb.save(tmp)
+    os.replace(tmp, full)
+
+
+def init_time_series_excel(path="time_series_all.xlsx"):
+    """Create the time-series workbook with a header row and flush it to disk.
+
+    Returns (workbook, worksheet, full_path), or (None, None, None) if openpyxl
+    is unavailable (the simulation then continues without the live Excel file).
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        print("[XLSX] openpyxl not installed — skipping live Excel export "
+              "(pip install openpyxl). The end-of-run CSV export is unaffected.")
+        return None, None, None
+
+    _ensure_outdir()
+    full = os.path.join(OUTPUT_DIR, path)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "time_series"
+    ws.append(time_series_fieldnames())
+    _save_workbook_atomic(wb, full)
+    print(f"[XLSX] created live time-series workbook: {full}")
+    return wb, ws, full
+
+
+def append_time_series_excel(wb, ws, full, row: dict):
+    """Append one timestep's row and flush the workbook to disk immediately."""
+    if wb is None:
+        return
+    values = []
+    for name in time_series_fieldnames():
+        v = row.get(name)
+        # Excel has no NaN/Inf — write a blank cell instead.
+        if isinstance(v, float) and not np.isfinite(v):
+            v = None
+        values.append(v)
+    ws.append(values)
+    _save_workbook_atomic(wb, full)
 
 
 # =============================================================================
@@ -415,14 +485,63 @@ def _liquid_sphere_mask(grid: VoxelGrid3D, center_um: np.ndarray, radius_um: flo
     return sphere & (~grid.solid_mask) & (~grid.hypha_mask)
 
 
+def _liquid_sphere_indices(grid: VoxelGrid3D, center_um: np.ndarray, radius_um: float):
+    """LIQUID voxel indices within `radius_um` of `center_um`, selected over the
+    sphere's index bounding box instead of the whole grid.
+
+    Returns (ii, jj, kk) global index arrays in ascending C-order. This is the
+    index form of ``np.argwhere(_liquid_sphere_mask(...))`` and selects exactly
+    the same voxels in the same order, but only touches an O(r³) sub-block rather
+    than scanning every voxel. Used by the consumption path (`consume_at_point`),
+    which also reuses the single selection for all its local means.
+    """
+    n = grid.n
+    dx = grid.dx_um
+    # Symmetric index box around the centre voxel, padded by one voxel so the
+    # sphere is fully contained; voxels outside the sphere fail the distance test
+    # below and drop out, so the padding never changes the selected set.
+    r_vox = int(np.ceil(radius_um / dx)) + 1
+    ci = int(np.floor((center_um[0] - grid.min_um[0]) / dx))
+    cj = int(np.floor((center_um[1] - grid.min_um[1]) / dx))
+    ck = int(np.floor((center_um[2] - grid.min_um[2]) / dx))
+
+    i0 = max(0, ci - r_vox); i1 = min(n - 1, ci + r_vox)
+    j0 = max(0, cj - r_vox); j1 = min(n - 1, cj + r_vox)
+    k0 = max(0, ck - r_vox); k1 = min(n - 1, ck + r_vox)
+
+    empty = np.empty(0, dtype=np.intp)
+    if i0 > i1 or j0 > j1 or k0 > k1:
+        return empty, empty, empty
+
+    xs = grid.x_centers[i0:i1 + 1]
+    ys = grid.y_centers[j0:j1 + 1]
+    zs = grid.z_centers[k0:k1 + 1]
+    ddx = xs[:, None, None] - center_um[0]
+    ddy = ys[None, :, None] - center_um[1]
+    ddz = zs[None, None, :] - center_um[2]
+    sphere = (ddx * ddx + ddy * ddy + ddz * ddz) <= (radius_um * radius_um)
+
+    liquid = (sphere
+              & (~grid.solid_mask[i0:i1 + 1, j0:j1 + 1, k0:k1 + 1])
+              & (~grid.hypha_mask[i0:i1 + 1, j0:j1 + 1, k0:k1 + 1]))
+
+    loc = np.argwhere(liquid)
+    if loc.shape[0] == 0:
+        return empty, empty, empty
+    return loc[:, 0] + i0, loc[:, 1] + j0, loc[:, 2] + k0
+
+
 def mean_local_in_sphere(grid: VoxelGrid3D, center_um: np.ndarray, radius_um: float, names) -> dict:
     """Mean of named nutrients over LIQUID voxels in a sphere around `center_um`."""
-    liquid = _liquid_sphere_mask(grid, center_um, radius_um)
+    ii, jj, kk = _liquid_sphere_indices(grid, center_um, radius_um)
     means = {}
     for name in names:
-        arr = grid.nutrients[name]
-        valid = liquid & np.isfinite(arr)
-        means[name] = float(np.mean(arr[valid])) if np.any(valid) else 0.0
+        if ii.shape[0] == 0:
+            means[name] = 0.0
+            continue
+        vals = grid.nutrients[name][ii, jj, kk]
+        finite = np.isfinite(vals)
+        means[name] = float(np.mean(vals[finite])) if np.any(finite) else 0.0
     return means
 
 
@@ -434,11 +553,11 @@ def mean_local_NPO(grid: VoxelGrid3D, center_um: np.ndarray, radius_um: float) -
 
 def mean_local_citric(grid: VoxelGrid3D, center_um: np.ndarray, radius_um: float) -> float:
     """Mean citric acid concentration (mM) over LIQUID voxels in a sphere around `center_um`."""
-    liquid = _liquid_sphere_mask(grid, center_um, radius_um)
-    if not np.any(liquid):
+    ii, jj, kk = _liquid_sphere_indices(grid, center_um, radius_um)
+    if ii.shape[0] == 0:
         return 0.0
     arr = grid.metabolites["citric_acid_spatial_mM"]
-    return float(np.mean(arr[liquid]))
+    return float(np.mean(arr[ii, jj, kk]))
 
 
 def growth_rate_from_local(means: dict) -> float:
@@ -487,10 +606,10 @@ def top_k_score_voxels(grid: VoxelGrid3D, center_um: np.ndarray, radius_um: floa
 
     If `k` is None, all candidate voxels are returned in score order.
     """
-    liquid = _liquid_sphere_mask(grid, center_um, radius_um)
-    cand_idx = np.argwhere(liquid)
-    if cand_idx.size == 0:
+    ii, jj, kk = _liquid_sphere_indices(grid, center_um, radius_um)
+    if ii.shape[0] == 0:
         return []
+    cand_idx = np.stack([ii, jj, kk], axis=1)
 
     N_init = float(NUTRIENT_SPECS["Nitrogen"]["mean"])
     P_init = float(NUTRIENT_SPECS["Phosphorus"]["mean"])
@@ -680,19 +799,21 @@ def consume_at_point(grid: VoxelGrid3D, point_um: np.ndarray, biomass_g: float,
     Returns mmol of citric acid produced (0.0 if the active glucose pathway
     is not engaged at this point).
     """
-    liquid = _liquid_sphere_mask(grid, point_um, DEPLETION_RADIUS)
-    cand_idx = np.argwhere(liquid)
-    if cand_idx.size == 0:
+    # Select the liquid voxels once (bounding-box scan) and reuse the selection
+    # for every local mean and every per-voxel update below.
+    ii, jj, kk = _liquid_sphere_indices(grid, point_um, DEPLETION_RADIUS)
+    n_cells = int(ii.shape[0])
+    if n_cells == 0:
         return 0.0
 
-    n_cells = int(cand_idx.shape[0])
     voxel_vol_L = grid.voxel_volume_L()
-    ii = cand_idx[:, 0]; jj = cand_idx[:, 1]; kk = cand_idx[:, 2]
 
-    means = mean_local_in_sphere(
-        grid, point_um, DEPLETION_RADIUS,
-        ("Nitrogen", "Phosphorus", "Oxygen", "Glucose"),
-    )
+    # Local means over those same voxels (matches mean_local_in_sphere exactly).
+    means = {}
+    for name in ("Nitrogen", "Phosphorus", "Oxygen", "Glucose"):
+        vals = grid.nutrients[name][ii, jj, kk]
+        finite = np.isfinite(vals)
+        means[name] = float(np.mean(vals[finite])) if np.any(finite) else 0.0
 
     # ---- N, P, O via standard Michaelis–Menten ----
     for name, (v_max, K_m) in NUTRIENT_MM_PARAMS.items():
@@ -713,7 +834,7 @@ def consume_at_point(grid: VoxelGrid3D, point_um: np.ndarray, biomass_g: float,
     v_G_passive = V_G1 * G                                          # mmol·gDW⁻¹·h⁻¹
     v_G_active = 0.0
     if ca_active and G > 0.0:
-        C = mean_local_citric(grid, point_um, DEPLETION_RADIUS)
+        C = float(np.mean(grid.metabolites["citric_acid_spatial_mM"][ii, jj, kk]))
         inhibition = 1.0 + (C / K_I2)
         denom = (K_G2 + G) * inhibition
         if denom > 0.0:
@@ -1386,6 +1507,10 @@ def plot_time_series(history: dict):
 if __name__ == "__main__":
     _ensure_outdir()
 
+    # Live, crash-safe time-series workbook: created now, with one row flushed to
+    # disk after every completed timestep so a Ctrl+C partway keeps all done steps.
+    xlsx_wb, xlsx_ws, xlsx_path = init_time_series_excel("time_series_all.xlsx")
+
     grid = VoxelGrid3D(extent_um=EXTENT_UM, n=N_GRID)
     initialize_nutrients(grid)
 
@@ -1439,29 +1564,39 @@ if __name__ == "__main__":
         # 1. Tip growth + apical branching
         n_grew = 0
         n_apical = 0
+        t_identify = 0.0   # time identifying which tips to grow (get_growing_tips)
+        t_enact = 0.0      # time enacting growth / apical / lateral branching
         for cid, G in graphs.items():
             if G.number_of_nodes() == 0:
                 continue
+            _t0 = time.perf_counter()
             tips = get_growing_tips(G, root=0)
+            _t1 = time.perf_counter()
+            t_identify += _t1 - _t0
             for tip in tips:
                 tag = step_tip(grid, G, cid, tip, step)
                 if tag == "GROW":
                     n_grew += 1
                 elif tag == "BRANCH":
                     n_apical += 1
+            t_enact += time.perf_counter() - _t1
 
         # 2. Lateral branching (uses pre-consumption nutrient state)
         n_lateral = 0
+        _t_lat = time.perf_counter()
         for cid, G in graphs.items():
             if G.number_of_nodes() == 0:
                 continue
             n_lateral += len(lateral_branching(grid, G, cid, step))
+        t_enact += time.perf_counter() - _t_lat
 
         branch_event_counters["apical"]  += n_apical
         branch_event_counters["lateral"] += n_lateral
 
         # 3. Consumption pass: N/P/O + Glucose; CA produced as a by-product
+        _t_consume = time.perf_counter()
         total_ca_mmol_step, n_ca_events = consume_nutrients(grid, graphs)
+        t_consume = time.perf_counter() - _t_consume
 
         # 4. Record metrics (post-consumption, pre-diffusion — matches Model 3 ordering)
         m = compute_metrics(grid, graphs)
@@ -1484,7 +1619,9 @@ if __name__ == "__main__":
             history["mean_nutrients"][nutr].append(nut_means.get(nutr, float("nan")))
 
         # 5. Nutrient averaging (well-mixed bath; re-sample at post-consumption mean)
+        _t_diffuse = time.perf_counter()
         average_nutrients(grid)
+        t_diffuse = time.perf_counter() - _t_diffuse
 
         print(
             f"step={step}  grew={n_grew}  apical={n_apical}  lateral={n_lateral}  "
@@ -1493,8 +1630,34 @@ if __name__ == "__main__":
             f"len={m['total_length_um']:.1f}µm  vol={m['total_volume_um3']:.1f}µm³  "
             f"<N>={nut_means['Nitrogen']:.2f} <P>={nut_means['Phosphorus']:.4f} "
             f"<O>={nut_means['Oxygen']:.4g} <G>={nut_means['Glucose']:.2f} mM  "
-            f"CA(step)={total_ca_mmol_step:.4g} CA(cum)={m['citric_total_mmol']:.4g} mmol"
+            f"CA(step)={total_ca_mmol_step:.4g} CA(cum)={m['citric_total_mmol']:.4g} mmol  "
+            f"| t_identify_tips={t_identify*1e3:.1f}ms "
+            f"t_grow/branch={t_enact*1e3:.1f}ms "
+            f"t_consume(incl.CA)={t_consume*1e3:.1f}ms "
+            f"t_diffuse={t_diffuse*1e3:.1f}ms"
         )
+
+        # Flush this completed step's row to the live Excel workbook (crash-safe).
+        xlsx_row = {
+            "step": step,
+            "time_hr": float(step * TIME_STEP_HR),
+            "total_length_um": float(m["total_length_um"]),
+            "total_volume_um3": float(m["total_volume_um3"]),
+            "avg_length_um": float(m["avg_length_um"]),
+            "avg_volume_um3": float(m["avg_volume_um3"]),
+            "avg_tips_per_hypha": float(m["avg_tips_per_hypha"]),
+            "n_hyphae": int(m["n_hyphae"]),
+            "total_branch_nodes": int(m["total_branch_nodes"]),
+            "total_tips": int(m["total_tips"]),
+            "citric_total_mmol": float(m["citric_total_mmol"]),
+            "citric_mM": float(m["citric_mM"]),
+            "liquid_volume_L": float(m["liquid_volume_L"]),
+            "apical_branch_events": int(branch_event_counters["apical"]),
+            "lateral_branch_events": int(branch_event_counters["lateral"]),
+        }
+        for nutr in NUTRIENT_SPECS.keys():
+            xlsx_row[f"mean_{nutr}_mM"] = float(nut_means.get(nutr, float("nan")))
+        append_time_series_excel(xlsx_wb, xlsx_ws, xlsx_path, xlsx_row)
 
     plot_skeletons_3d(graphs, grid, title=f"Hypha skeletons after {N_STEPS} steps")
     plot_time_series(history)
